@@ -132,11 +132,12 @@ function joinGame(roomId) {
     myRoomId = roomId;
     const room = gun.get('bingo-rooms').get(roomId);
     
-    statusText.innerText = "Syncing with peers...";
+    // Transition UI Immediately
+    startScreen.classList.add('hidden');
+    lobbyScreen.classList.remove('hidden');
+    statusText.innerText = "Connecting to P2P network...";
 
     // Handle Player Assignment
-    // We use a simple logic: p1 is the host (first to join), p2 is the second.
-    // We store this in localStorage so if someone refreshes they keep their slot.
     let savedKey = localStorage.getItem(`bingo_role_${roomId}`);
     if (savedKey) {
         myPlayerKey = savedKey;
@@ -165,7 +166,6 @@ function joinGame(roomId) {
             localStorage.setItem(`bingo_board_${roomId}`, JSON.stringify(boardNumbers));
         }
         
-        startScreen.classList.add('hidden');
         renderBoard();
         setupSubscriptions(room);
     });
