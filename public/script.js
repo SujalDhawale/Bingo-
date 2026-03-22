@@ -1,15 +1,9 @@
-// Firebase Setup (Destructured from window.firebase set in index.html)
-const { initializeApp, getDatabase, ref, set, onValue, push, serverTimestamp, onDisconnect } = window.firebase;
-
-// --- CONFIGURATION ---
-// IMPORTANT: Replace this with your own Firebase Config from the Firebase Console!
-const firebaseConfig = {
-  databaseURL: "https://bingo-multiplayer-demo-default-rtdb.firebaseio.com/" // Placeholder - user should replace this
-};
-
-// Initialize Firebase
-const app = initializeApp(firebaseConfig);
-const db = getDatabase(app);
+// Initialize Gun with public relay peers
+const gun = Gun([
+    'https://gun-manhattan.herokuapp.com/gun',
+    'https://relay.peer.ooo/gun',
+    'https://gun-server.herokuapp.com/gun'
+]);
 
 // DOM Elements
 const startScreen = document.getElementById('start-screen');
@@ -42,7 +36,7 @@ let selectedNumbers = [];
 let myTurn = false;
 let myPlayerKey = null; // 'p1' or 'p2'
 let linesCompleted = 0;
-let roomRef = null;
+let roomData = null;
 
 // Init
 function init() {
@@ -86,14 +80,14 @@ function renderBoard() {
 function handleCellClick(num) {
     if (!myTurn || selectedNumbers.includes(num)) return;
     
-    // Update Firebase with the selected number
-    const newSelected = [...selectedNumbers, num];
+    // Update Gun with the selected number
     const nextTurn = (myPlayerKey === 'p1') ? 'p2' : 'p1';
     
-    set(ref(db, `rooms/${myRoomId}/gameData`), {
-        selectedNumbers: newSelected,
-        turn: nextTurn,
-        playersCount: 2 // Keep it at 2
+    // Add number to the list (using an object as a set in Gun)
+    gun.get('bingo-rooms').get(myRoomId).get('selected').get(num.toString()).put(true);
+    // Switch turn
+    gun.get('bingo-rooms').get(myRoomId).get('state').put({
+        turn: nextTurn
     });
 }
 
@@ -121,7 +115,7 @@ function checkBingo() {
         linesCompleted = currentLines;
         updateBingoUI();
         if (linesCompleted >= 5) {
-            set(ref(db, `rooms/${myRoomId}/winner`), myPlayerKey);
+            gun.get('bingo-rooms').get(myRoomId).get('state').put({ winner: myPlayerKey });
         }
     }
 }
@@ -133,99 +127,108 @@ function updateBingoUI() {
     });
 }
 
-// Firebase Logic
-async function joinGame(roomId) {
+// Networking Logic
+function joinGame(roomId) {
     myRoomId = roomId;
-    roomRef = ref(db, `rooms/${roomId}`);
+    const room = gun.get('bingo-rooms').get(roomId);
     
-    // 1. Try to claim a player slot
-    onValue(ref(db, `rooms/${roomId}/gameData`), (snapshot) => {
-        const data = snapshot.val();
-        
+    statusText.innerText = "Syncing with peers...";
+
+    // Handle Player Assignment
+    // We use a simple logic: p1 is the host (first to join), p2 is the second.
+    // We store this in localStorage so if someone refreshes they keep their slot.
+    let savedKey = localStorage.getItem(`bingo_role_${roomId}`);
+    if (savedKey) {
+        myPlayerKey = savedKey;
+    }
+
+    room.get('players').once((players) => {
         if (!myPlayerKey) {
-            // New user joining
-            if (!data) {
-                // First player
+            if (!players || !players.p1) {
                 myPlayerKey = 'p1';
-                set(ref(db, `rooms/${roomId}/gameData`), {
-                    playersCount: 1,
-                    turn: 'p1',
-                    selectedNumbers: []
-                });
-                boardNumbers = generateBoardArray();
-                localStorage.setItem(`bingo_board_${roomId}`, JSON.stringify(boardNumbers));
-            } else if (data.playersCount === 1) {
-                // Second player
+                room.get('players').get('p1').put(true);
+            } else if (!players.p2) {
                 myPlayerKey = 'p2';
-                set(ref(db, `rooms/${roomId}/gameData`), {
-                    ...data,
-                    playersCount: 2
-                });
-                boardNumbers = generateBoardArray();
-                localStorage.setItem(`bingo_board_${roomId}`, JSON.stringify(boardNumbers));
+                room.get('players').get('p2').put(true);
             } else {
-                // Already full or reconnecting
-                const savedBoard = localStorage.getItem(`bingo_board_${roomId}`);
-                if (savedBoard) {
-                    boardNumbers = JSON.parse(savedBoard);
-                    // Decide role based on simple logic or prompt (simplified for demo)
-                    myPlayerKey = 'p1'; // Fallback
-                } else {
-                    alert("Room is full!");
-                    window.location.href = "/";
-                    return;
-                }
+                myPlayerKey = 'spectator';
             }
+            localStorage.setItem(`bingo_role_${roomId}`, myPlayerKey);
         }
-
-        // Update Game State from Firebase
-        if (data) {
-            selectedNumbers = data.selectedNumbers || [];
-            
-            if (data.playersCount < 2) {
-                lobbyScreen.classList.remove('hidden');
-                gameScreen.classList.add('hidden');
-                statusText.innerText = "Waiting for Player 2...";
-            } else {
-                startScreen.classList.add('hidden');
-                lobbyScreen.classList.add('hidden');
-                gameScreen.classList.remove('hidden');
-                
-                myTurn = (data.turn === myPlayerKey);
-                updateUI(data.turn);
-                renderBoard();
-                checkBingo();
-            }
+        
+        // Load or Create Board
+        let savedBoard = localStorage.getItem(`bingo_board_${roomId}`);
+        if (savedBoard) {
+            boardNumbers = JSON.parse(savedBoard);
+        } else {
+            boardNumbers = generateBoardArray();
+            localStorage.setItem(`bingo_board_${roomId}`, JSON.stringify(boardNumbers));
         }
-    }, { onlyOnce: false });
-
-    // 2. Chat Logic
-    onValue(ref(db, `rooms/${roomId}/messages`), (snapshot) => {
-        const messages = snapshot.val();
-        chatMessages.innerHTML = '';
-        if (messages) {
-            Object.values(messages).forEach(msg => {
-                const msgDiv = document.createElement('div');
-                msgDiv.classList.add('message');
-                msgDiv.classList.add(msg.sender === myPlayerKey ? 'sent' : 'received');
-                msgDiv.innerText = msg.text;
-                chatMessages.appendChild(msgDiv);
-            });
-            chatMessages.scrollTop = chatMessages.scrollHeight;
-        }
-    });
-
-    // 3. Winner Logic
-    onValue(ref(db, `rooms/${roomId}/winner`), (snapshot) => {
-        const winner = snapshot.val();
-        if (winner) {
-            gameOverModal.classList.remove('hidden');
-            winnerText.innerText = (winner === myPlayerKey) ? "YOU WIN! BINGO!" : "YOU LOSE!";
-        }
+        
+        startScreen.classList.add('hidden');
+        renderBoard();
+        setupSubscriptions(room);
     });
 
     const cleanUrl = window.location.origin + window.location.pathname + '?room=' + roomId;
     linkInput.value = cleanUrl;
+}
+
+function setupSubscriptions(room) {
+    // 1. Sync Game State (Turn, Winner, PlayersCount)
+    room.get('state').on((state) => {
+        if (!state) {
+            // Initialize state if first time
+            room.get('state').put({ turn: 'p1', playersCount: 1 });
+            return;
+        }
+
+        // Handle Player Visibility
+        room.get('players').on((players) => {
+            const count = (players.p1 ? 1 : 0) + (players.p2 ? 1 : 0);
+            if (count < 2) {
+                lobbyScreen.classList.remove('hidden');
+                gameScreen.classList.add('hidden');
+                statusText.innerText = "Waiting for Friend...";
+            } else {
+                lobbyScreen.classList.add('hidden');
+                gameScreen.classList.remove('hidden');
+            }
+        });
+
+        myTurn = (state.turn === myPlayerKey);
+        updateUI(state.turn);
+        
+        if (state.winner) {
+            gameOverModal.classList.remove('hidden');
+            winnerText.innerText = (state.winner === myPlayerKey) ? "YOU WIN! BINGO!" : "YOU LOSE!";
+        }
+    });
+
+    // 2. Sync Selected Numbers
+    room.get('selected').map().on((val, num) => {
+        const n = parseInt(num);
+        if (val && !selectedNumbers.includes(n)) {
+            selectedNumbers.push(n);
+            renderBoard();
+            checkBingo();
+        }
+    });
+
+    // 3. Chat Logic
+    room.get('chat').map().on((msg, id) => {
+        if (!msg) return;
+        // Check if message already exists
+        if (document.getElementById(`msg-${id}`)) return;
+
+        const msgDiv = document.createElement('div');
+        msgDiv.id = `msg-${id}`;
+        msgDiv.classList.add('message');
+        msgDiv.classList.add(msg.sender === myPlayerKey ? 'sent' : 'received');
+        msgDiv.innerText = msg.text;
+        chatMessages.appendChild(msgDiv);
+        chatMessages.scrollTop = chatMessages.scrollHeight;
+    });
 }
 
 function updateUI(currentTurn) {
@@ -233,15 +236,14 @@ function updateUI(currentTurn) {
         turnIndicator.innerText = "YOUR TURN";
         turnIndicator.classList.add('active-turn');
         statusText.innerText = "Select a number!";
-        badgeP1.classList.toggle('active', myPlayerKey === 'p1');
-        badgeP2.classList.toggle('active', myPlayerKey === 'p2');
     } else {
         turnIndicator.innerText = "OPPONENT'S TURN";
         turnIndicator.classList.remove('active-turn');
-        statusText.innerText = "Waiting...";
-        badgeP1.classList.toggle('active', myPlayerKey !== 'p1');
-        badgeP2.classList.toggle('active', myPlayerKey !== 'p2');
+        statusText.innerText = "Waiting for friend...";
     }
+    
+    badgeP1.classList.toggle('active', currentTurn === 'p1');
+    badgeP2.classList.toggle('active', currentTurn === 'p2');
 }
 
 // Chat Listeners
@@ -252,19 +254,19 @@ function sendMessage() {
     const text = chatInput.value.trim();
     if (!text || !myRoomId) return;
     
-    push(ref(db, `rooms/${myRoomId}/messages`), {
+    const msgId = Date.now().toString() + Math.random().toString(36).substring(2, 5);
+    gun.get('bingo-rooms').get(myRoomId).get('chat').get(msgId).put({
         text: text,
         sender: myPlayerKey,
-        timestamp: serverTimestamp()
+        time: Date.now()
     });
     chatInput.value = '';
 }
 
 // Actions
 createBtn.addEventListener('click', () => {
-    const newRoomId = Math.random().toString(36).substring(2, 7).toUpperCase();
-    window.history.pushState({}, '', `?room=${newRoomId}`);
-    joinGame(newRoomId);
+    const newRoomId = 'BINGO-' + Math.random().toString(36).substring(2, 7).toUpperCase();
+    window.location.href = `?room=${newRoomId}`; // Reload to ensure Gun initializes fresh for new room
 });
 
 copyBtn.addEventListener('click', () => {

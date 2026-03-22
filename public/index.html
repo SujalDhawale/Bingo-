@@ -101,13 +101,9 @@
         </div>
     </div>
 
-    <!-- Firebase SDKs -->
-    <script type="module">
-        import { initializeApp } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-app.js";
-        import { getDatabase, ref, set, onValue, push, serverTimestamp, onDisconnect } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-database.js";
-        
-        window.firebase = { initializeApp, getDatabase, ref, set, onValue, push, serverTimestamp, onDisconnect };
-    </script>
-    <script src="script.js" type="module"></script>
+    <!-- Gun.js for Zero-Config Real-time Sync -->
+    <script src="https://cdn.jsdelivr.net/npm/gun/gun.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/gun/sea.js"></script>
+    <script src="script.js"></script>
 </body>
 </html>
