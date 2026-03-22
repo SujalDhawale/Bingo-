@@ -1,4 +1,15 @@
-const socket = io();
+// Firebase Setup (Destructured from window.firebase set in index.html)
+const { initializeApp, getDatabase, ref, set, onValue, push, serverTimestamp, onDisconnect } = window.firebase;
+
+// --- CONFIGURATION ---
+// IMPORTANT: Replace this with your own Firebase Config from the Firebase Console!
+const firebaseConfig = {
+  databaseURL: "https://bingo-multiplayer-demo-default-rtdb.firebaseio.com/" // Placeholder - user should replace this
+};
+
+// Initialize Firebase
+const app = initializeApp(firebaseConfig);
+const db = getDatabase(app);
 
 // DOM Elements
 const startScreen = document.getElementById('start-screen');
@@ -20,13 +31,18 @@ const playAgainBtn = document.getElementById('play-again-btn');
 const badgeP1 = document.getElementById('badge-p1');
 const badgeP2 = document.getElementById('badge-p2');
 
+const chatMessages = document.getElementById('chat-messages');
+const chatInput = document.getElementById('chat-input');
+const sendChatBtn = document.getElementById('send-chat-btn');
+
 // Game State Local
 let myRoomId = null;
-let boardNumbers = []; // The localized randomized 1-25 array
+let boardNumbers = []; 
 let selectedNumbers = [];
 let myTurn = false;
-let myId = null;
+let myPlayerKey = null; // 'p1' or 'p2'
 let linesCompleted = 0;
+let roomRef = null;
 
 // Init
 function init() {
@@ -34,10 +50,8 @@ function init() {
     const roomFromUrl = urlParams.get('room');
 
     if (roomFromUrl) {
-        // Joining existing game
         joinGame(roomFromUrl);
     } else {
-        // Normal start screen
         startScreen.classList.remove('hidden');
     }
 }
@@ -59,7 +73,6 @@ function renderBoard() {
         cell.classList.add('bingo-cell');
         cell.innerText = num;
         cell.dataset.num = num;
-        cell.dataset.index = index;
         
         if (selectedNumbers.includes(num)) {
             cell.classList.add('marked');
@@ -73,24 +86,26 @@ function renderBoard() {
 function handleCellClick(num) {
     if (!myTurn || selectedNumbers.includes(num)) return;
     
-    // Attempt move
-    socket.emit('select_number', { roomId: myRoomId, number: num });
+    // Update Firebase with the selected number
+    const newSelected = [...selectedNumbers, num];
+    const nextTurn = (myPlayerKey === 'p1') ? 'p2' : 'p1';
+    
+    set(ref(db, `rooms/${myRoomId}/gameData`), {
+        selectedNumbers: newSelected,
+        turn: nextTurn,
+        playersCount: 2 // Keep it at 2
+    });
 }
 
 // Check Bingo
 function checkBingo() {
-    // 5x5 grid winning lines
     const winLines = [
-        // Rows
         [0,1,2,3,4], [5,6,7,8,9], [10,11,12,13,14], [15,16,17,18,19], [20,21,22,23,24],
-        // Cols
         [0,5,10,15,20], [1,6,11,16,21], [2,7,12,17,22], [3,8,13,18,23], [4,9,14,19,24],
-        // Diagonals
         [0,6,12,18,24], [4,8,12,16,20]
     ];
 
     let currentLines = 0;
-
     for (let line of winLines) {
         let isComplete = true;
         for (let idx of line) {
@@ -105,43 +120,150 @@ function checkBingo() {
     if (currentLines !== linesCompleted) {
         linesCompleted = currentLines;
         updateBingoUI();
-
         if (linesCompleted >= 5) {
-            socket.emit('declare_winner', myRoomId);
+            set(ref(db, `rooms/${myRoomId}/winner`), myPlayerKey);
         }
     }
 }
 
 function updateBingoUI() {
-    for (let i = 0; i < bingoWords.length; i++) {
-        if (i < linesCompleted) {
-            bingoWords[i].classList.add('active');
-        } else {
-            bingoWords[i].classList.remove('active');
-        }
-    }
+    bingoWords.forEach((span, i) => {
+        if (i < linesCompleted) span.classList.add('active');
+        else span.classList.remove('active');
+    });
 }
 
-// Networking
-function joinGame(roomId) {
+// Firebase Logic
+async function joinGame(roomId) {
     myRoomId = roomId;
-    boardNumbers = generateBoardArray();
-    renderBoard();
+    roomRef = ref(db, `rooms/${roomId}`);
     
-    socket.emit('join_room', roomId);
-    startScreen.classList.add('hidden');
-    lobbyScreen.classList.remove('hidden');
+    // 1. Try to claim a player slot
+    onValue(ref(db, `rooms/${roomId}/gameData`), (snapshot) => {
+        const data = snapshot.val();
+        
+        if (!myPlayerKey) {
+            // New user joining
+            if (!data) {
+                // First player
+                myPlayerKey = 'p1';
+                set(ref(db, `rooms/${roomId}/gameData`), {
+                    playersCount: 1,
+                    turn: 'p1',
+                    selectedNumbers: []
+                });
+                boardNumbers = generateBoardArray();
+                localStorage.setItem(`bingo_board_${roomId}`, JSON.stringify(boardNumbers));
+            } else if (data.playersCount === 1) {
+                // Second player
+                myPlayerKey = 'p2';
+                set(ref(db, `rooms/${roomId}/gameData`), {
+                    ...data,
+                    playersCount: 2
+                });
+                boardNumbers = generateBoardArray();
+                localStorage.setItem(`bingo_board_${roomId}`, JSON.stringify(boardNumbers));
+            } else {
+                // Already full or reconnecting
+                const savedBoard = localStorage.getItem(`bingo_board_${roomId}`);
+                if (savedBoard) {
+                    boardNumbers = JSON.parse(savedBoard);
+                    // Decide role based on simple logic or prompt (simplified for demo)
+                    myPlayerKey = 'p1'; // Fallback
+                } else {
+                    alert("Room is full!");
+                    window.location.href = "/";
+                    return;
+                }
+            }
+        }
+
+        // Update Game State from Firebase
+        if (data) {
+            selectedNumbers = data.selectedNumbers || [];
+            
+            if (data.playersCount < 2) {
+                lobbyScreen.classList.remove('hidden');
+                gameScreen.classList.add('hidden');
+                statusText.innerText = "Waiting for Player 2...";
+            } else {
+                startScreen.classList.add('hidden');
+                lobbyScreen.classList.add('hidden');
+                gameScreen.classList.remove('hidden');
+                
+                myTurn = (data.turn === myPlayerKey);
+                updateUI(data.turn);
+                renderBoard();
+                checkBingo();
+            }
+        }
+    }, { onlyOnce: false });
+
+    // 2. Chat Logic
+    onValue(ref(db, `rooms/${roomId}/messages`), (snapshot) => {
+        const messages = snapshot.val();
+        chatMessages.innerHTML = '';
+        if (messages) {
+            Object.values(messages).forEach(msg => {
+                const msgDiv = document.createElement('div');
+                msgDiv.classList.add('message');
+                msgDiv.classList.add(msg.sender === myPlayerKey ? 'sent' : 'received');
+                msgDiv.innerText = msg.text;
+                chatMessages.appendChild(msgDiv);
+            });
+            chatMessages.scrollTop = chatMessages.scrollHeight;
+        }
+    });
+
+    // 3. Winner Logic
+    onValue(ref(db, `rooms/${roomId}/winner`), (snapshot) => {
+        const winner = snapshot.val();
+        if (winner) {
+            gameOverModal.classList.remove('hidden');
+            winnerText.innerText = (winner === myPlayerKey) ? "YOU WIN! BINGO!" : "YOU LOSE!";
+        }
+    });
 
     const cleanUrl = window.location.origin + window.location.pathname + '?room=' + roomId;
     linkInput.value = cleanUrl;
 }
 
-createBtn.addEventListener('click', () => {
-    // Generate random 5-char room id
-    const newRoomId = Math.random().toString(36).substring(2, 7).toUpperCase();
-    const newUrl = window.location.origin + window.location.pathname + '?room=' + newRoomId;
-    window.history.pushState({}, '', newUrl); // update URL without reload
+function updateUI(currentTurn) {
+    if (myTurn) {
+        turnIndicator.innerText = "YOUR TURN";
+        turnIndicator.classList.add('active-turn');
+        statusText.innerText = "Select a number!";
+        badgeP1.classList.toggle('active', myPlayerKey === 'p1');
+        badgeP2.classList.toggle('active', myPlayerKey === 'p2');
+    } else {
+        turnIndicator.innerText = "OPPONENT'S TURN";
+        turnIndicator.classList.remove('active-turn');
+        statusText.innerText = "Waiting...";
+        badgeP1.classList.toggle('active', myPlayerKey !== 'p1');
+        badgeP2.classList.toggle('active', myPlayerKey !== 'p2');
+    }
+}
+
+// Chat Listeners
+sendChatBtn.addEventListener('click', sendMessage);
+chatInput.addEventListener('keypress', (e) => { if (e.key === 'Enter') sendMessage(); });
+
+function sendMessage() {
+    const text = chatInput.value.trim();
+    if (!text || !myRoomId) return;
     
+    push(ref(db, `rooms/${myRoomId}/messages`), {
+        text: text,
+        sender: myPlayerKey,
+        timestamp: serverTimestamp()
+    });
+    chatInput.value = '';
+}
+
+// Actions
+createBtn.addEventListener('click', () => {
+    const newRoomId = Math.random().toString(36).substring(2, 7).toUpperCase();
+    window.history.pushState({}, '', `?room=${newRoomId}`);
     joinGame(newRoomId);
 });
 
@@ -153,71 +275,7 @@ copyBtn.addEventListener('click', () => {
 });
 
 playAgainBtn.addEventListener('click', () => {
-    window.location.href = window.location.origin + window.location.pathname; // Reload without query
-});
-
-// Socket Events
-socket.on('connect', () => {
-    myId = socket.id;
-    console.log("Connected as", myId);
-});
-
-socket.on('room_full', () => {
-    alert("This game room is already full.");
     window.location.href = window.location.origin + window.location.pathname;
-});
-
-socket.on('update_game_state', (state) => {
-    console.log("State:", state);
-    selectedNumbers = state.selectedNumbers;
-    
-    // Wait for 2 players
-    if (state.playersCount < 2) {
-        lobbyScreen.classList.remove('hidden');
-        gameScreen.classList.add('hidden');
-        return;
-    }
-
-    // Both players joined
-    lobbyScreen.classList.add('hidden');
-    gameScreen.classList.remove('hidden');
-
-    // Update Turn
-    myTurn = (state.turn === myId);
-    
-    if (myTurn) {
-        turnIndicator.innerText = "YOUR TURN";
-        turnIndicator.classList.add('active-turn');
-        statusText.innerText = "Select a number from the board";
-        badgeP1.classList.add('active');
-        badgeP2.classList.remove('active');
-    } else {
-        turnIndicator.innerText = "OPPONENT'S TURN";
-        turnIndicator.classList.remove('active-turn');
-        statusText.innerText = "Waiting for opponent...";
-        badgeP1.classList.remove('active');
-        badgeP2.classList.add('active');
-    }
-
-    renderBoard(); // Visual update
-    checkBingo();  // Check local grid for bingo logic
-});
-
-socket.on('player_disconnected', () => {
-    alert("Opponent disconnected. Game gracefully ended.");
-    window.location.href = window.location.origin + window.location.pathname;
-});
-
-socket.on('game_over', ({ winner }) => {
-    gameOverModal.classList.remove('hidden');
-    if (winner === myId) {
-        winnerText.innerText = "YOU WIN! BINGO!";
-    } else {
-        winnerText.innerText = "YOU LOSE!";
-        winnerText.style.background = "linear-gradient(135deg, #ff0055, #ffaa00)";
-        winnerText.style.webkitBackgroundClip = "text";
-        winnerText.style.webkitTextFillColor = "transparent";
-    }
 });
 
 init();
